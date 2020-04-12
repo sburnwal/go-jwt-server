@@ -1,36 +1,71 @@
 package main
 
 import (
+	"crypto/rsa"
 	"fmt"
-	"github.com/appleboy/gin-jwt-server/config"
-	"github.com/appleboy/gin-jwt-server/input"
-	"github.com/appleboy/gin-jwt-server/model"
-	"github.com/appleboy/gin-status-api"
-	jwt "github.com/dgrijalva/jwt-go"
-	"github.com/fvbock/endless"
-	"github.com/gin-gonic/gin"
-	"github.com/go-sql-driver/mysql"
-	"github.com/go-xorm/xorm"
-	"github.com/satori/go.uuid"
-	"golang.org/x/crypto/bcrypt"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/appleboy/gin-jwt-server/config"
+	"github.com/appleboy/gin-jwt-server/input"
+	"github.com/appleboy/gin-jwt-server/model"
+	status "github.com/appleboy/gin-status-api"
+	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go/request"
+	"github.com/fvbock/endless"
+	"github.com/gin-gonic/gin"
+	"github.com/go-sql-driver/mysql"
+	"github.com/go-xorm/xorm"
+	uuid "github.com/satori/go.uuid"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const (
-	JWTSigningKey string        = "appleboy"
-	ExpireTime    time.Duration = time.Minute * 60 * 24 * 30
-	Realm         string        = "jwt auth"
+	ExpireTime	time.Duration 	= time.Minute * 60 * 24 * 30
+	Realm		string        	= "jwt auth"
+	JwtIssuer	string 			= "MyCompany"
+	JwtAudience string 			= "MyApp"
 )
 
+var keyFuncError error = fmt.Errorf("error loading key")
+
 var (
+	verifyKey  *rsa.PublicKey
+	signKey    *rsa.PrivateKey
+
+	defaultKeyFunc	jwt.Keyfunc = func(t *jwt.Token) (interface{}, error) { 
+		return verifyKey, nil
+	}
+
 	orm         *xorm.Engine
 	currentUser model.User
 )
+
+func initKeys() {
+	log.Println("Initialzing RSA Public and Private Keys")
+	signBytes, err := ioutil.ReadFile("privkey.pem")
+	if err != nil {
+		log.Fatal(err)
+	}
+	signKey, err = jwt.ParseRSAPrivateKeyFromPEM(signBytes)
+	if err != nil { 
+		log.Fatal(err)
+	}
+
+	verifyBytes, err := ioutil.ReadFile("pubkey.pem")
+	if err != nil {
+		log.Fatal(err)
+	}
+	verifyKey, err = jwt.ParseRSAPublicKeyFromPEM(verifyBytes)
+	if err != nil { 
+		log.Fatal(err)
+	}
+}
 
 func AbortWithError(c *gin.Context, code int, message string) {
 	c.Header("WWW-Authenticate", "JWT realm="+Realm)
@@ -44,21 +79,25 @@ func AbortWithError(c *gin.Context, code int, message string) {
 func Auth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var user model.User
-		token, err := jwt.ParseFromRequest(c.Request, func(token *jwt.Token) (interface{}, error) {
-			b := ([]byte(JWTSigningKey))
-
-			return b, nil
-		})
+		var token *jwt.Token
+		var err error
+		var tokenStr string
+		
+		tokenStr, err = request.OAuth2Extractor.ExtractToken(c.Request)
+		log.Println("Got token from request", tokenStr)
+		if token, err = request.ParseFromRequest(c.Request, request.OAuth2Extractor, defaultKeyFunc); err == nil {
+			claims := token.Claims.(jwt.MapClaims)
+			log.Println("Token for user", claims["sub"], "expires", claims["exp"])
+		}
 
 		if err != nil {
 			AbortWithError(c, http.StatusUnauthorized, "Invaild User Token")
 			return
 		}
 
-		log.Printf("Current user id: %s", token.Claims["id"])
+		claims := token.Claims.(jwt.MapClaims)
 
-		_, err = orm.Where("id = ?", token.Claims["id"]).Get(&user)
-
+		_, err = orm.Where("id = ?", claims["id"]).Get(&user)
 		if err != nil {
 			AbortWithError(c, http.StatusInternalServerError, "DB Query Error")
 			return
@@ -90,14 +129,19 @@ func LoginHandler(c *gin.Context) {
 	}
 
 	expire := time.Now().Add(ExpireTime)
+	// Create the Claims
+	claims := &jwt.StandardClaims{
+		Issuer:    JwtIssuer,
+		IssuedAt: time.Now().Unix(),
+		ExpiresAt: expire.Unix(),
+		Audience: JwtAudience,
+		Subject: user.Id, 
+		Id: user.Id,
+	} 
 
-	// Create the token
-	token := jwt.New(jwt.SigningMethodHS256)
-	// Set some claims
-	token.Claims["id"] = user.Id
-	token.Claims["exp"] = expire.Unix()
-	// Sign and get the complete encoded token as a string
-	tokenString, err := token.SignedString([]byte(JWTSigningKey))
+	//create the token
+	token := jwt.NewWithClaims(jwt.GetSigningMethod("RS256"), claims)
+	tokenString, err := token.SignedString(signKey)
 
 	if err != nil {
 		AbortWithError(c, http.StatusUnauthorized, "Create JWT Token faild")
@@ -122,11 +166,14 @@ func RegisterHandler(c *gin.Context) {
 	has, err := orm.Where("username = ?", form.Username).Get(&user)
 
 	if has {
-		AbortWithError(c, http.StatusBadRequest, "Username is already exist")
+		AbortWithError(c, http.StatusBadRequest, "Username already exists")
 		return
 	}
 
-	userId := uuid.NewV4().String()
+	userId, err := uuid.NewV4()
+	if err != nil {
+		AbortWithError(c, http.StatusInternalServerError, err.Error())
+	}
 
 	if digest, err := bcrypt.GenerateFromPassword([]byte(form.Password), bcrypt.DefaultCost); err != nil {
 		AbortWithError(c, http.StatusInternalServerError, err.Error())
@@ -136,7 +183,7 @@ func RegisterHandler(c *gin.Context) {
 	}
 
 	_, err = orm.Insert(&model.User{
-		Id:       userId,
+		Id:       userId.String(),
 		Username: form.Username,
 		Password: form.Password,
 	})
@@ -153,14 +200,34 @@ func RegisterHandler(c *gin.Context) {
 }
 
 func RefreshHandler(c *gin.Context) {
+	var  token *jwt.Token
+	var err error
+	if token, err = request.ParseFromRequest(c.Request, request.OAuth2Extractor, defaultKeyFunc); err == nil {
+		claims := token.Claims.(jwt.MapClaims)
+		fmt.Printf("Token for user %v expires %v", claims["user"], claims["exp"])
+	}
+	if err != nil {
+		AbortWithError(c, http.StatusInternalServerError, "Error parsing JWT")
+		return
+	}
+
 	expire := time.Now().Add(ExpireTime)
 
-	// Create the token
-	token := jwt.New(jwt.SigningMethodHS256)
-	// Set some claims
-	token.Claims["exp"] = expire.Unix()
+	existingClaims := token.Claims.(jwt.MapClaims)
+	// Create the Claims
+	claims := &jwt.StandardClaims{
+		Issuer:    JwtIssuer,
+		IssuedAt: time.Now().Unix(),
+		ExpiresAt: expire.Unix(),
+		Audience: JwtAudience,
+		Subject: existingClaims["id"].(string), 
+		Id: existingClaims["id"].(string),
+	} 
+
+	//create the token
+	token = jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	// Sign and get the complete encoded token as a string
-	tokenString, err := token.SignedString([]byte(JWTSigningKey))
+	tokenString, err := token.SignedString(signKey)
 
 	if err != nil {
 		AbortWithError(c, http.StatusUnauthorized, "Create JWT Token faild")
@@ -188,6 +255,7 @@ func initDB() {
 	connectStr := &mysql.Config{
 		User:   configs.DB_USERNAME,
 		Passwd: configs.DB_PASSWORD,
+		AllowNativePasswords: true,
 		Net:    "tcp",
 		Addr:   net.JoinHostPort(configs.DB_HOST, strconv.Itoa(configs.DB_PORT)),
 		DBName: configs.DB_NAME,
@@ -204,12 +272,9 @@ func initDB() {
 
 	orm = db
 
-	_, err = orm.Insert(&model.User{
-		Id: uuid.NewV4().String(),
-	})
-
-	if err != nil {
-		fmt.Println(err)
+	session := orm.Where("username = 'test")
+	if session != nil {
+		log.Println("Error intitializing the database")
 		return
 	}
 }
@@ -223,6 +288,8 @@ func main() {
 	if port == "" {
 		port = "8000"
 	}
+
+	initKeys()
 
 	// initial DB setting
 	initDB()
@@ -240,7 +307,7 @@ func main() {
 	api := r.Group("/api")
 	api.Use(Auth())
 	{
-		api.GET("/status", status.StatusHandler)
+		api.GET("/status", status.GinHandler)
 	}
 
 	endless.ListenAndServe(":"+port, r)
