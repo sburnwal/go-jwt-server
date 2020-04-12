@@ -30,6 +30,10 @@ const (
 	Realm		string        	= "jwt auth"
 	JwtIssuer	string 			= "MyCompany"
 	JwtAudience string 			= "MyApp"
+	PrivateKeyFile string 		= "privkey.pem"
+	PublicKeyFile string		= "pubkey.pem"
+	SvrKeyFile string 			= "svrkey.pem"
+	SvrCertFile string			= "svrcert.pem"
 )
 
 var keyFuncError error = fmt.Errorf("error loading key")
@@ -48,7 +52,7 @@ var (
 
 func initKeys() {
 	log.Println("Initialzing RSA Public and Private Keys")
-	signBytes, err := ioutil.ReadFile("privkey.pem")
+	signBytes, err := ioutil.ReadFile(PrivateKeyFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -57,7 +61,7 @@ func initKeys() {
 		log.Fatal(err)
 	}
 
-	verifyBytes, err := ioutil.ReadFile("pubkey.pem")
+	verifyBytes, err := ioutil.ReadFile(PublicKeyFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -310,5 +314,5 @@ func main() {
 		api.GET("/status", status.GinHandler)
 	}
 
-	endless.ListenAndServe(":"+port, r)
+	endless.ListenAndServeTLS(":"+port, SvrCertFile, SvrKeyFile, r)
 }
